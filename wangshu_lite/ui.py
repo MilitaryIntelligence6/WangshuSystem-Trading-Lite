@@ -76,6 +76,8 @@ class TradingWindow(QMainWindow):
         self._buttons = []
         self._table_values = {}
         self._catalog_symbols = ()
+        self._connection_drafts = {}
+        self._active_connection_environment = "simulation"
         self.setWindowTitle("望舒 Lite · 人工交易与 vn.py CTA")
         self.resize(1220, 860)
         self.setMinimumSize(760, 600)
@@ -128,37 +130,77 @@ class TradingWindow(QMainWindow):
         self.layout = QVBoxLayout(content)
         self.layout.setContentsMargins(12, 10, 12, 10)
         self.layout.setSpacing(8)
-        self.connection_panel = QGroupBox("连接")
+        self.connection_panel = QGroupBox("光大期货 CTP 连接")
         grid = QGridLayout(self.connection_panel)
-        self.mode = self._combo([("离线演练", "paper"), ("CTP", "ctp")])
-        self.sdk = self._combo([("生产 SDK", "实盘"), ("测试 SDK", "测试")])
+        self.mode = self._combo([("光大 CTP 仿真", "simulation"), ("离线演练 PAPER", "paper"), ("其他 CTP", "ctp")])
+        self.sdk = self._combo([("生产 SDK（按光大要求）", "实盘"), ("测试 SDK（按光大要求）", "测试")])
+        self.account_environment = self._combo([("仿真账户", "simulation"), ("实盘账户", "live")])
+        self.account_environment.setAccessibleName("账户环境；SDK 模式不代表账户类型")
+        self.front_pair = self._combo([("前置组 1", "1"), ("前置组 2", "2")])
+        for column, (label, widget) in enumerate((("连接环境", self.mode), ("账户环境", self.account_environment),
+                                                 ("SDK 模式", self.sdk), ("使用前置组", self.front_pair))):
+            box = QVBoxLayout()
+            box.addWidget(QLabel(label))
+            box.addWidget(widget)
+            grid.addLayout(box, 0, column)
         self.settings = {}
-        fields = [("经纪商代码", "BrokerID"), ("用户名", "账户"), ("密码", "密码"),
-                  ("产品名称", "AppID"), ("授权编码", "AuthCode"),
-                  ("交易服务器", "交易前置 tcp://…"), ("行情服务器", "行情前置 tcp://…")]
-        grid.addWidget(QLabel("环境"), 0, 0)
-        grid.addWidget(self.mode, 0, 1)
-        grid.addWidget(QLabel("SDK"), 0, 2)
-        grid.addWidget(self.sdk, 0, 3)
-        for index, (key, placeholder) in enumerate(fields):
+        fields = [("经纪商代码", "BrokerID"), ("用户名", "账户"), ("密码", "交易密码"),
+                  ("产品名称", "AppID"), ("授权编码", "AuthCode")]
+        for index, (key, title) in enumerate(fields):
             field = QLineEdit()
-            field.setPlaceholderText(placeholder)
-            field.setAccessibleName(placeholder)
+            field.setAccessibleName(title)
             if key in {"密码", "授权编码"}:
                 field.setEchoMode(QLineEdit.EchoMode.Password)
             self.settings[key] = field
-            row, column = 1 + index // 4, index % 4
-            grid.addWidget(field, row, column)
-        self.account_environment = self._combo([("账户环境：仿真", "simulation"), ("账户环境：实盘", "live")])
-        self.account_environment.setAccessibleName("账户环境；需人工核对，SDK 模式不代表账户类型")
-        grid.addWidget(self.account_environment, 2, 3)
-        self.settlement = QCheckBox("已核对柜台环境与结算；允许登录后确认当日结算")
-        grid.addWidget(self.settlement, 3, 0, 1, 3)
+            box = QVBoxLayout()
+            box.addWidget(QLabel(title))
+            box.addWidget(field)
+            grid.addLayout(box, 1 + index // 4, index % 4)
+        for row, pair in enumerate((("交易服务器", "行情服务器"), ("交易服务器备选", "行情服务器备选")), 3):
+            number = row - 2
+            for column, key in enumerate(pair):
+                field = QLineEdit()
+                title = f"前置组 {number} · {'交易' if column == 0 else '行情'}前置"
+                field.setAccessibleName(title)
+                field.setPlaceholderText("tcp://主机:端口")
+                self.settings[key] = field
+                box = QVBoxLayout()
+                box.addWidget(QLabel(title))
+                box.addWidget(field)
+                grid.addLayout(box, row, column * 2, 1, 2)
+        front_note = QLabel("只连接所选组的交易与行情前置，不自动混用另一组。仿真也可能使用生产 SDK，请按光大资料选择。")
+        front_note.setWordWrap(True)
+        grid.addWidget(front_note, 5, 0, 1, 4)
+        self.settlement = QCheckBox("已核对光大仿真账户、前置及结算；允许登录后确认当日结算")
+        grid.addWidget(self.settlement, 6, 0, 1, 3)
         connect_row = QHBoxLayout()
-        self.connect_button = self._button("连接", self.connect_session, connect_row)
+        self.connect_button = self._button("连接光大仿真", self.connect_session, connect_row)
         self.disconnect_button = self._button("断开", self.disconnect_session, connect_row)
-        grid.addLayout(connect_row, 3, 3)
-        self.mode.currentIndexChanged.connect(self._connection_fields)
+        grid.addLayout(connect_row, 6, 3)
+        save_row = QHBoxLayout()
+        self.remember_credentials = QCheckBox("记住本机凭据（系统安全凭据库）")
+        save_row.addWidget(self.remember_credentials)
+        self.save_connection_button = self._button("保存连接参数", self.save_connection, save_row)
+        self.load_connection_button = self._button("加载已保存参数", self.load_connection, save_row)
+        self.clear_credentials_button = self._button("清除已存凭据", self.clear_credentials, save_row)
+        save_row.addStretch()
+        grid.addLayout(save_row, 7, 0, 1, 4)
+        self.connection_note = QLabel("普通参数保存在本机；账户、密码、AuthCode 仅在明确勾选后写入系统安全凭据库。")
+        self.connection_note.setWordWrap(True)
+        grid.addWidget(self.connection_note, 8, 0, 1, 4)
+        self.connection_progress = QLabel("尚未连接柜台")
+        self.connection_progress.setWordWrap(True)
+        grid.addWidget(self.connection_progress, 9, 0, 1, 4)
+        self.connection_error = QLabel()
+        self.connection_error.setWordWrap(True)
+        self.connection_error.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        grid.addWidget(self.connection_error, 10, 0, 1, 4)
+        self.mode.currentIndexChanged.connect(self._connection_selection_changed)
+        self.account_environment.currentIndexChanged.connect(self._connection_selection_changed)
+        self.sdk.currentIndexChanged.connect(self._invalidate_confirmation)
+        self.front_pair.currentIndexChanged.connect(self._invalidate_confirmation)
+        for field in self.settings.values():
+            field.textChanged.connect(self._invalidate_confirmation)
         self.layout.addWidget(self.connection_panel)
 
         toolbar = QHBoxLayout()
@@ -182,7 +224,7 @@ class TradingWindow(QMainWindow):
         self.logs.setReadOnly(True)
         self.logs.setMaximumBlockCount(500)
         self.tabs.addTab(self.logs, "日志")
-        self.notice = QLabel("委托、成交及撤单结果以柜台回报为准。密码和 AuthCode 不保存到配置。")
+        self.notice = QLabel("委托、成交及撤单结果以柜台回报为准。连接参数不包含账户、密码或 AuthCode。")
         self.notice.setWordWrap(True)
         self.layout.addWidget(self.notice)
         scroll = QScrollArea()
@@ -316,14 +358,67 @@ class TradingWindow(QMainWindow):
         layout.addWidget(self.strategy_detail)
         self.tabs.addTab(tab, "CTA 策略")
 
+    def _invalidate_confirmation(self, _value=None):
+        self.settlement.setChecked(False)
+
+    def _connection_environment(self):
+        mode = self.mode.currentData()
+        if mode == "paper":
+            return None
+        return "simulation" if mode == "simulation" else self.account_environment.currentData()
+
+    @staticmethod
+    def _set_connection_value(widget, value):
+        prior = widget.blockSignals(True)
+        try:
+            if isinstance(widget, QLineEdit):
+                widget.setText(value)
+            else:
+                widget.setCurrentIndex(max(0, widget.findData(value)))
+        finally:
+            widget.blockSignals(prior)
+
+    def _apply_connection_values(self, settings, environment):
+        for key, field in self.settings.items():
+            self._set_connection_value(field, settings.get(key, ""))
+        for widget, value in ((self.sdk, settings.get("柜台环境", "实盘")),
+                              (self.account_environment, environment),
+                              (self.front_pair, settings.get("前置组", "1"))):
+            self._set_connection_value(widget, value)
+        self.settlement.setChecked(False)
+
+    def _connection_selection_changed(self, _index=None):
+        environment = self._connection_environment()
+        previous = self._active_connection_environment
+        self._invalidate_confirmation()
+        if environment != previous:
+            if previous is not None:
+                self._connection_drafts[previous] = dict(self._connection_settings(), 账户环境=previous)
+            self._active_connection_environment = environment
+            if environment is not None:
+                self._apply_connection_values(self._connection_drafts.get(environment, {}), environment)
+                self.remember_credentials.setChecked(False)
+                self.connection_note.setText("已切换到本环境的内存草稿；请核对账户、前置与结算。")
+        self._connection_fields()
+
     def _connection_fields(self):
         active = self.state.get("mode") in {"paper", "ctp"}
-        enabled = self.mode.currentData() == "ctp" and not active and not self._busy and not self._closing
+        mode = self.mode.currentData()
+        enabled = mode != "paper" and not active and not self._busy and not self._closing
+        if mode == "simulation":
+            self._set_connection_value(self.account_environment, "simulation")
         for field in self.settings.values():
             field.setEnabled(enabled)
         self.sdk.setEnabled(enabled)
-        self.account_environment.setEnabled(enabled)
+        self.front_pair.setEnabled(enabled)
+        self.account_environment.setEnabled(enabled and mode == "ctp")
         self.settlement.setEnabled(enabled)
+        self.remember_credentials.setEnabled(enabled)
+        for button in (self.save_connection_button, self.load_connection_button, self.clear_credentials_button):
+            button.setEnabled(enabled)
+        self.connect_button.setText({"paper": "启动离线演练", "simulation": "连接光大仿真", "ctp": "连接 CTP"}[mode])
+        self.settlement.setText("已核对光大仿真账户、前置及结算；允许登录后确认当日结算" if mode == "simulation"
+                                else "已核对账户环境、前置与结算；允许登录后确认当日结算")
 
     def confirm(self, title, message):
         return QMessageBox.question(self, title, message, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -369,6 +464,8 @@ class TradingWindow(QMainWindow):
             else:
                 if action == "发送委托":
                     message = "委托请求已提交：" + _value(result) + "；最终状态以柜台回报为准"
+                elif action == "加载连接参数":
+                    message = "已加载本机连接参数；请核对后连接"
                 else:
                     message = action + "已完成" + ("：" + _value(result) if result is not None else "")
                 self.statusBar().showMessage(message, 8000)
@@ -407,18 +504,66 @@ class TradingWindow(QMainWindow):
         self.mode.setEnabled(idle and not active)
         self._connection_fields()
 
-    def connect_session(self):
-        mode = self.mode.currentData()
+    def _connection_settings(self):
         settings = {key: field.text() if key in {"密码", "授权编码"} else field.text().strip()
                     for key, field in self.settings.items()}
         settings["柜台环境"] = self.sdk.currentData()
-        settings["账户环境"] = self.account_environment.currentData()
+        settings["账户环境"] = "simulation" if self.mode.currentData() == "simulation" else self.account_environment.currentData()
+        settings["前置组"] = self.front_pair.currentData()
+        return settings
+
+    def connect_session(self):
+        selected = self.mode.currentData()
+        mode = "ctp" if selected == "simulation" else selected
+        settings = self._connection_settings()
         if mode == "ctp" and not self.settlement.isChecked():
-            QMessageBox.warning(self, "连接前核对", "请先核对柜台环境与结算，并勾选结算确认。SDK 模式不能判断账户是仿真还是实盘。")
+            QMessageBox.warning(self, "连接前核对", "请先核对光大提供的账户、前置与结算，并勾选结算确认。SDK 模式不能判断账户是仿真还是实盘。")
             return
         confirmed = self.settlement.isChecked()
         self._submit("连接", lambda: self.runtime.connect(mode=mode, settings=settings if mode == "ctp" else {},
                                                         settlement_confirmed=confirmed))
+
+    def save_connection(self):
+        settings = self._connection_settings()
+        remember = self.remember_credentials.isChecked()
+        self._submit("保存连接参数", lambda: self.runtime.save_connection(settings, remember_credentials=remember),
+                     lambda result: self.connection_note.setText(str(result)))
+
+    def load_connection(self):
+        environment = self._connection_settings()["账户环境"]
+        self._submit("加载连接参数", lambda: self.runtime.load_connection(environment=environment, with_credentials=True),
+                     self._loaded_connection)
+
+    def _loaded_connection(self, settings):
+        settings = dict(settings)
+        credential_error = settings.pop("_credential_error", "")
+        if credential_error:
+            for key in ("用户名", "密码", "授权编码"):
+                settings[key] = ""
+        environment = self._connection_environment() or "simulation"
+        self._apply_connection_values(settings, environment)
+        self._connection_drafts[environment] = self._connection_settings()
+        if credential_error:
+            self.connection_note.setText("普通参数已加载；凭据读取失败：" + str(credential_error) + "。请手工输入凭据。")
+        else:
+            self.connection_note.setText("已加载本机参数；请重新核对账户、前置与结算。未自动连接。")
+
+    def clear_credentials(self):
+        if not self.confirm("清除已存凭据", "从本应用的系统安全凭据库清除账户、密码和 AuthCode？普通连接参数保持不变。"):
+            return
+        environment = self._connection_settings()["账户环境"]
+        self._submit("清除已存凭据", lambda: self.runtime.clear_connection_credentials(environment=environment),
+                     self._cleared_credentials)
+
+    def _cleared_credentials(self, message):
+        for key in ("用户名", "密码", "授权编码"):
+            self.settings[key].clear()
+        self.remember_credentials.setChecked(False)
+        self.settlement.setChecked(False)
+        environment = self._connection_environment()
+        if environment is not None:
+            self._connection_drafts[environment] = self._connection_settings()
+        self.connection_note.setText(str(message))
 
     def disconnect_session(self):
         if self.confirm("断开柜台", "将停止策略并禁止新单。断开不等于柜台委托已撤销，请核对活动委托。继续断开？"):
@@ -629,6 +774,23 @@ class TradingWindow(QMainWindow):
         if not self._busy and not self._closing:
             label = "已允许下单" if state.get("enabled") else "禁止新单"
             self.status.setText(f"{label} · {connection.get('trading_day', '')} · {connection.get('reason', '未连接')}")
+        phases = state.get("connection_status") or {}
+        names = (("authenticated", "认证"), ("trader_logged_in", "交易登录"), ("market_logged_in", "行情登录"),
+                 ("settlement_confirmed", "结算确认"), ("contracts_ready", "合约查询"))
+        profile = state.get("connection_profile") or {}
+        prefix = "光大 CTP 仿真" if profile.get("environment") == "simulation" else "CTP"
+        if state.get("mode") == "ctp" and phases:
+            text = prefix + " · " + "  ".join(label + ("：完成" if phases.get(key) else "：等待") for key, label in names)
+            if profile.get("front_pair"):
+                text += f" · 前置组 {profile['front_pair']}"
+            self.connection_progress.setText(text)
+        elif state.get("mode") == "paper":
+            self.connection_progress.setText("离线 PAPER 演练；没有连接光大期货柜台")
+        else:
+            self.connection_progress.setText("尚未连接光大期货柜台")
+        error = state.get("connection_error", "")
+        self.connection_error.setText("最近连接错误：" + error if error else "")
+        self.connection_error.setVisible(bool(error))
         account = state.get("account") or {}
         self.account_label.setText("   ".join(label + " " + _value(account.get(key)) for label, key in
                                             (("资金", "balance"), ("可用", "available"), ("保证金", "margin"), ("冻结保证金", "frozen_margin"), ("手续费", "commission"))))

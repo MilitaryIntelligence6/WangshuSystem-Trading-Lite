@@ -219,6 +219,13 @@ class VnpyGateway:
         with self._lock:
             return self._health
 
+    def connection_status(self) -> dict:
+        """Observed handshake stages for the UI; no additional trading gates."""
+        with self._lock:
+            return {"authenticated": self._authenticated,
+                    "trader_logged_in": self._td_login, "market_logged_in": self._md_login,
+                    "settlement_confirmed": self._settled, "contracts_ready": self._contracts_ready}
+
     def snapshot_revision(self) -> int:
         with self._lock:
             return self._state_revision

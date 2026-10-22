@@ -69,6 +69,7 @@ class DesktopTests(unittest.TestCase):
         self.wait(check)
 
     def connect_paper(self):
+        self.window.mode.setCurrentIndex(self.window.mode.findData("paper"))
         self.window.connect_button.click()
         self.refreshed(lambda state: state.get("connection", {}).get("ready", False))
         self.window.enable_button.click()
@@ -219,8 +220,8 @@ class DesktopTests(unittest.TestCase):
         self.window.mode.setCurrentIndex(self.window.mode.findData("ctp"))
         self.window.account_environment.setCurrentIndex(self.window.account_environment.findData("live"))
         self.window.sdk.setCurrentIndex(self.window.sdk.findData("测试"))
-        self.window.settlement.setChecked(True)
         self.window.settings["密码"].setText(" password with spaces ")
+        self.window.settlement.setChecked(True)
         with patch.object(self.runtime, "connect") as connect:
             self.window.connect_button.click()
             self.wait(lambda: not self.window._busy)
@@ -235,6 +236,160 @@ class DesktopTests(unittest.TestCase):
         self.assertTrue(self.window.disconnect_button.isEnabled())
         self.assertFalse(self.window.connect_button.isEnabled())
         self.assertTrue(self.window.cancel_button.isEnabled())
+
+    def test_simulation_entry_uses_real_ctp_transport_and_selected_pair(self):
+        self.assertEqual(self.window.mode.currentData(), "simulation")
+        self.assertEqual(self.window.connect_button.text(), "连接光大仿真")
+        self.assertFalse(self.window.account_environment.isEnabled())
+        self.window.sdk.setCurrentIndex(self.window.sdk.findData("实盘"))
+        self.window.front_pair.setCurrentIndex(self.window.front_pair.findData("2"))
+        for key, value in {"交易服务器": "tcp://group1.invalid:1", "行情服务器": "tcp://group1.invalid:2",
+                           "交易服务器备选": "tcp://group2.invalid:3", "行情服务器备选": "tcp://group2.invalid:4"}.items():
+            self.window.settings[key].setText(value)
+        self.window.settlement.setChecked(True)
+        with patch.object(self.runtime, "connect") as connect:
+            self.window.connect_button.click()
+            self.wait(lambda: not self.window._busy)
+            kwargs = connect.call_args.kwargs
+            self.assertEqual(kwargs["mode"], "ctp")
+            self.assertEqual(kwargs["settings"]["账户环境"], "simulation")
+            self.assertEqual(kwargs["settings"]["柜台环境"], "实盘")
+            self.assertEqual(kwargs["settings"]["前置组"], "2")
+            self.assertEqual(kwargs["settings"]["交易服务器备选"], "tcp://group2.invalid:3")
+            self.assertEqual(kwargs["settings"]["行情服务器备选"], "tcp://group2.invalid:4")
+        self.window.mode.setCurrentIndex(self.window.mode.findData("paper"))
+        self.assertEqual(self.window.connect_button.text(), "启动离线演练")
+        self.window.mode.setCurrentIndex(self.window.mode.findData("simulation"))
+        self.assertEqual(self.window.settings["交易服务器备选"].text(), "tcp://group2.invalid:3")
+        self.assertFalse(self.errors)
+        self.screenshot("lite-simulation-connection.png")
+
+    def test_connection_save_load_clear_stay_off_ui_thread_without_secret_status(self):
+        self.window.timer.stop()
+        self.window.settings["经纪商代码"].setText("test-broker")
+        self.window.settings["用户名"].setText("test-user")
+        self.window.settings["密码"].setText(" secret with spaces ")
+        self.window.settings["授权编码"].setText(" secret-auth ")
+        self.window.remember_credentials.setChecked(True)
+        calls = []
+        saved = {}
+        def save(settings, remember_credentials=False):
+            calls.append(("save", threading.current_thread(), remember_credentials))
+            saved.update(settings)
+            return "参数已保存在本机"
+        def load(environment="simulation", with_credentials=True):
+            calls.append(("load", threading.current_thread(), with_credentials))
+            return dict(saved)
+        def clear(environment="simulation"):
+            calls.append(("clear", threading.current_thread(), environment))
+            return "本机凭据已清除"
+        with patch.object(self.runtime, "save_connection", side_effect=save, create=True), \
+             patch.object(self.runtime, "load_connection", side_effect=load, create=True), \
+             patch.object(self.runtime, "clear_connection_credentials", side_effect=clear, create=True):
+            self.window.save_connection_button.click()
+            self.wait(lambda: not self.window._busy)
+            self.assertEqual(saved["密码"], " secret with spaces ")
+            self.assertEqual(saved["授权编码"], " secret-auth ")
+            self.window.settings["密码"].clear()
+            self.window.settlement.setChecked(True)
+            self.window.load_connection_button.click()
+            self.wait(lambda: not self.window._busy)
+            self.assertEqual(self.window.settings["密码"].text(), " secret with spaces ")
+            self.assertFalse(self.window.settlement.isChecked())
+            self.assertNotIn("secret", self.window.statusBar().currentMessage())
+            self.window.clear_credentials_button.click()
+            self.wait(lambda: not self.window._busy)
+            for key in ("用户名", "密码", "授权编码"):
+                self.assertEqual(self.window.settings[key].text(), "")
+            self.assertEqual(self.window.settings["经纪商代码"].text(), "test-broker")
+            self.assertFalse(self.window.remember_credentials.isChecked())
+        self.assertEqual([item[0] for item in calls], ["save", "load", "clear"])
+        self.assertTrue(all(item[1] is not threading.main_thread() for item in calls))
+        self.assertFalse(self.errors)
+
+    def test_live_and_simulation_drafts_are_isolated_and_confirmation_expires(self):
+        window = self.window
+        window.settings["用户名"].setText("simulation-user")
+        window.settings["交易服务器"].setText("tcp://simulation.invalid:1")
+        window.settings["密码"].setText("simulation-password")
+        window.settlement.setChecked(True)
+        window.mode.setCurrentIndex(window.mode.findData("ctp"))
+        self.assertFalse(window.settlement.isChecked())
+        window.account_environment.setCurrentIndex(window.account_environment.findData("live"))
+        for key in ("用户名", "密码", "交易服务器"):
+            self.assertEqual(window.settings[key].text(), "")
+        window.settings["用户名"].setText("live-user")
+        window.settings["密码"].setText("live-password")
+        window.settings["交易服务器"].setText("tcp://live.invalid:1")
+        window.sdk.setCurrentIndex(window.sdk.findData("测试"))
+        window.front_pair.setCurrentIndex(window.front_pair.findData("2"))
+        window.settlement.setChecked(True)
+        window.mode.setCurrentIndex(window.mode.findData("simulation"))
+        self.assertEqual(window.settings["用户名"].text(), "simulation-user")
+        self.assertEqual(window.settings["密码"].text(), "simulation-password")
+        self.assertEqual(window.settings["交易服务器"].text(), "tcp://simulation.invalid:1")
+        self.assertEqual(window.sdk.currentData(), "实盘")
+        self.assertEqual(window.front_pair.currentData(), "1")
+        self.assertFalse(window.settlement.isChecked())
+        for change in (lambda: window.settings["交易服务器"].setText("tcp://simulation.invalid:2"),
+                       lambda: window.sdk.setCurrentIndex(window.sdk.findData("测试")),
+                       lambda: window.front_pair.setCurrentIndex(window.front_pair.findData("2"))):
+            window.settlement.setChecked(True)
+            change()
+            self.assertFalse(window.settlement.isChecked())
+        window.mode.setCurrentIndex(window.mode.findData("paper"))
+        window.mode.setCurrentIndex(window.mode.findData("simulation"))
+        self.assertEqual(window.settings["用户名"].text(), "simulation-user")
+        self.assertEqual(window.settings["交易服务器"].text(), "tcp://simulation.invalid:2")
+        # A frequent enable-state refresh must not clear the chosen draft.
+        window._connection_fields()
+        window._connection_fields()
+        self.assertEqual(window.settings["密码"].text(), "simulation-password")
+        window.mode.setCurrentIndex(window.mode.findData("ctp"))
+        window.account_environment.setCurrentIndex(window.account_environment.findData("live"))
+        self.assertEqual(window.settings["用户名"].text(), "live-user")
+        self.assertEqual(window.settings["密码"].text(), "live-password")
+        self.assertEqual(window.settings["交易服务器"].text(), "tcp://live.invalid:1")
+        self.assertEqual(window.sdk.currentData(), "测试")
+        self.assertEqual(window.front_pair.currentData(), "2")
+        self.assertFalse(window.settlement.isChecked())
+
+    def test_vault_failure_keeps_public_parameters_and_shows_actual_error(self):
+        self.window.settings["用户名"].setText("stale-user")
+        self.window.settings["密码"].setText("stale-password")
+        self.window.settings["授权编码"].setText("stale-auth")
+        saved = {"经纪商代码": "saved-broker", "产品名称": "saved-app",
+                 "交易服务器": "tcp://saved.invalid:1", "行情服务器": "tcp://saved.invalid:2",
+                 "_credential_error": "系统安全凭据库不可用"}
+        with patch.object(self.runtime, "load_connection", return_value=saved, create=True):
+            self.window.load_connection_button.click()
+            self.wait(lambda: not self.window._busy)
+        self.assertEqual(self.window.settings["经纪商代码"].text(), "saved-broker")
+        self.assertEqual(self.window.settings["交易服务器"].text(), "tcp://saved.invalid:1")
+        for key in ("用户名", "密码", "授权编码"):
+            self.assertEqual(self.window.settings[key].text(), "")
+        self.assertIn("系统安全凭据库不可用", self.window.connection_note.text())
+        self.assertIn("凭据读取失败", self.window.connection_note.text())
+        self.assertNotIn("stale-password", self.window.statusBar().currentMessage())
+        self.assertFalse(self.window.settlement.isChecked())
+
+    def test_simulation_connection_phases_and_failure_are_visible(self):
+        self.window.state.update(mode="ctp", connection={"ready": False, "connected": False},
+            connection_profile={"environment": "simulation", "front_pair": "2"},
+            connection_status={"authenticated": True, "trader_logged_in": True, "market_logged_in": False,
+                               "settlement_confirmed": False, "contracts_ready": False},
+            connection_error="CTP ErrorID=7：认证被拒绝")
+        self.window._render()
+        self.window._apply_enabled()
+        self.assertIn("光大 CTP 仿真", self.window.connection_progress.text())
+        self.assertIn("交易登录：完成", self.window.connection_progress.text())
+        self.assertIn("行情登录：等待", self.window.connection_progress.text())
+        self.assertIn("结算确认：等待", self.window.connection_progress.text())
+        self.assertIn("前置组 2", self.window.connection_progress.text())
+        self.assertIn("ErrorID=7", self.window.connection_error.text())
+        self.assertTrue(self.window.disconnect_button.isEnabled())
+        self.assertFalse(self.window.send_button.isEnabled())
+        self.screenshot("lite-simulation-phases.png")
 
     @unittest.skipUnless(importlib.util.find_spec("vnpy_ctastrategy") is not None, "official CTA dependency required")
     def test_real_cta_file_loading_initialization_and_callbacks_through_ui(self):

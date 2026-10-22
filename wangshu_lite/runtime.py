@@ -57,27 +57,72 @@ class Runtime:
         self._owns_native = False
         self._close_failed = False
         self._secrets = ()
+        self.connection_profile = {}
+        self.connection_error = ""
+
+    def _redact(self, message):
+        for secret in self._secrets:
+            message = str(message).replace(secret, "[已隐藏]")
+        return str(message)
 
     def log(self, message):
-        message = str(message)
-        for secret in self._secrets:
-            message = message.replace(secret, "[已隐藏]")
+        message = self._redact(message)
         with self._log_lock:
             self._logs.append({"time": time.time(), "message": message})
+
+    def _connection_event(self, kind, value):
+        if kind == "error":
+            self.connection_error = self._redact(value)
+
+    def load_connection(self, environment="simulation", with_credentials=True):
+        from .connections import ConnectionStore, ConnectionStoreError
+        store = ConnectionStore(self.directory)
+        try:
+            return store.load(environment, with_credentials)
+        except ConnectionStoreError as exc:
+            if not with_credentials:
+                raise
+            public = store.load(environment, with_credentials=False)
+            public["_credential_error"] = str(exc)
+            return public
+
+    def save_connection(self, settings, remember_credentials=False):
+        from .connections import ConnectionStore
+        return ConnectionStore(self.directory).save(settings, remember_credentials)
+
+    def clear_connection_credentials(self, environment="simulation"):
+        from .connections import ConnectionStore
+        return ConnectionStore(self.directory).clear_credentials(environment)
 
     def connect(self, mode="paper", settings=None, settlement_confirmed=False):
         with self._lifecycle:
             if self.kernel is not None:
                 raise TradingError("已有交易会话，请先断开")
+            settings = dict(settings or {})
+            if mode == "simulation":
+                mode = "ctp"
+                settings["账户环境"] = "simulation"
             if mode not in {"paper", "ctp"}:
                 raise TradingError("连接模式只能是 paper 或 ctp")
-            settings = dict(settings or {})
             if mode == "ctp":
                 if settlement_confirmed is not True:
                     raise TradingError("请先核对结算，并确认登录将确认当日结算单")
+                pair = str(settings.get("前置组", "1"))
+                if pair not in {"1", "2"}:
+                    raise TradingError("请选择前置组 1 或 2；交易和行情必须使用同一组")
+                if pair == "2":
+                    settings["交易服务器"] = settings.get("交易服务器备选", "")
+                    settings["行情服务器"] = settings.get("行情服务器备选", "")
+                settings["前置组"] = pair
+                # Pass exactly one selected pair. The native adapter must not
+                # silently combine one group's trader with another's market.
+                settings.pop("交易服务器备选", None)
+                settings.pop("行情服务器备选", None)
                 for key in ("用户名", "密码", "经纪商代码", "产品名称", "授权编码", "交易服务器", "行情服务器"):
-                    if not isinstance(settings.get(key), str) or not settings[key].strip():
-                        raise TradingError(f"请填写 CTP {key}")
+                    if not isinstance(settings.get(key), str) or not settings[key].strip() or len(settings[key]) > 512:
+                        raise TradingError(f"请完整填写光大 CTP {key}；选中前置组 {pair} 的交易和行情地址都需填写")
+                    if key not in {"密码", "授权编码"}:
+                        settings[key] = settings[key].strip()
                 for key in ("交易服务器", "行情服务器"):
                     try:
                         url = urlsplit(settings[key])
@@ -101,9 +146,13 @@ class Runtime:
             identity = "|".join((mode, settings.get("经纪商代码", ""), settings.get("用户名", "PAPER"), environment))
             binding = hashlib.sha256(identity.encode()).hexdigest()
             account_directory = self.directory / ("paper" if mode == "paper" else "ctp-" + binding[:20])
+            self.connection_profile = ({"front_pair": settings.get("前置组", "1"), "td_address": settings["交易服务器"],
+                                        "md_address": settings["行情服务器"], "environment": environment} if mode == "ctp" else {})
+            self.connection_error = ""
             try:
                 self.journal = Journal(account_directory, binding)
                 self.kernel = TradingKernel(self.journal, self.log, settings.get("用户名", "PAPER"), self._secrets)
+                self.kernel.add_listener(self._connection_event)
                 if mode == "paper":
                     from .paper import PaperGateway
                     self.gateway = PaperGateway(self.kernel.on_event, self.journal)
@@ -122,9 +171,10 @@ class Runtime:
                 self.log("已启动会话，默认禁止下单；请核对柜台状态后允许下单")
                 return "连接已启动，最终状态以柜台回报为准"
             except Exception as exc:
-                self.log(f"连接失败：{exc}")
+                self.connection_error = self._redact(exc)
+                self.log(f"连接失败：{self.connection_error}")
                 self.disconnect()
-                raise TradingError("连接失败，请检查安装环境与本地日志；敏感连接参数不会保存") from None
+                raise TradingError(f"连接失败：{self.connection_error}；请检查日志中的柜台回报") from None
 
     def _pulse(self):
         while not self._pulse_stop.wait(1):
@@ -216,6 +266,10 @@ class Runtime:
                 state = {"enabled": False, "fatal": False, "connection": {"connected": False, "ready": False, "trading_day": "", "reason": "尚未连接"},
                          "account": None, "positions": [], "orders": [], "trades": [], "ticks": [], "contracts": [], "unresolved": []}
             state["mode"] = self.mode
+            state["connection_profile"] = dict(self.connection_profile)
+            state["connection_status"] = (self.gateway.connection_status()
+                                           if self.gateway and hasattr(self.gateway, "connection_status") else {})
+            state["connection_error"] = self.connection_error
             state["strategies"] = self.strategies.snapshot() if self.strategies else []
             with self._log_lock:
                 state["logs"] = list(self._logs)

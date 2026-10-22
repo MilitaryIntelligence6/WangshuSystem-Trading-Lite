@@ -211,6 +211,22 @@ class KernelAuditTests(unittest.TestCase):
         self.assertNotIn("test-password", json.dumps(rows) + str(self.output))
         self.assertIn("[已隐藏]", str(self.output))
 
+    def test_audit_failure_preserves_original_redacted_broker_and_connection_messages(self):
+        oid = self.kernel.send_order(intent("one"))
+        with patch.object(self.journal, "audit", side_effect=OSError("disk full")):
+            self.kernel.on_event("error", "ErrorID=31 test-password broker rejection")
+            self.kernel.on_event("log", "test-password original native log")
+            self.kernel.on_event("connection", replace(self.connection, reason="ErrorID=7 test-password connection failure"))
+            self.assertFalse(self.kernel.enabled)
+            self.assertTrue(self.kernel.fatal)
+            self.kernel.cancel(oid)
+        self.gateway.cancel_order.assert_called_once()
+        messages = "\n".join(self.output)
+        self.assertIn("ErrorID=31 [已隐藏] broker rejection", messages)
+        self.assertIn("[已隐藏] original native log", messages)
+        self.assertIn("ErrorID=7 [已隐藏] connection failure", messages)
+        self.assertNotIn("test-password", messages)
+
     def test_cancel_attempts_include_failures_without_faking_success(self):
         one = self.kernel.send_order(intent("one"))
         two = self.kernel.send_order(intent("two"))

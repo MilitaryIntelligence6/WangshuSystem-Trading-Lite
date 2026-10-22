@@ -24,6 +24,7 @@ class ReportingTests(unittest.TestCase):
     def test_runtime_and_connection_logs_are_redacted_durable_and_exported(self):
         self.runtime._secrets = ("test-private-password",)
         self.runtime.log("认证 test-private-password 的运行记录")
+        self.assertTrue(self.runtime.snapshot()["logs"][-1]["persisted"])
         self.runtime.disconnect()
         self.runtime.connect()
         audit = self.runtime.snapshot()["audit"]
@@ -57,7 +58,9 @@ class ReportingTests(unittest.TestCase):
             self.assertTrue(self.runtime.kernel.fatal)
             self.runtime.cancel(order_id)
         self.assertEqual(self.runtime.kernel.orders[order_id].status, "CANCELLED")
-        self.assertTrue(any("日志写入失败" in row["message"] for row in self.runtime.snapshot()["logs"]))
+        failed_logs = [row for row in self.runtime.snapshot()["logs"] if "日志写入失败" in row["message"]]
+        self.assertTrue(failed_logs)
+        self.assertTrue(all(row["persisted"] is False for row in failed_logs))
 
     def test_bad_limit_save_does_not_disable_trading_and_export_requires_a_session(self):
         with self.assertRaises(TradingError):

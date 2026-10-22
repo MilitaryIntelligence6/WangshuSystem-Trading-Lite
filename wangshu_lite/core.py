@@ -88,8 +88,10 @@ class TradingKernel:
                         self.contracts.clear()
                         self.ticks.clear()
                     self.connection = data
-                    self._audit(kind, asdict(data))
-                    self.output(self.redact(f"连接状态：connected={data.connected}, ready={data.ready}, 交易日={data.trading_day or '未知'}；{data.reason}"))
+                    try:
+                        self._audit(kind, asdict(data))
+                    finally:
+                        self.output(self.redact(f"连接状态：connected={data.connected}, ready={data.ready}, 交易日={data.trading_day or '未知'}；{data.reason}"))
                 elif kind == "contract":
                     self.contracts[data.vt_symbol] = data
                 elif kind == "tick":
@@ -120,8 +122,10 @@ class TradingKernel:
                     self._audit(kind, asdict(data))
                 elif kind in {"log", "error"}:
                     data = self.redact(data)
-                    self._audit(kind, {"message": data})
-                    self.output(data)
+                    try:
+                        self._audit(kind, {"message": data})
+                    finally:
+                        self.output(data)
                 self._notify(kind, data)
             except Exception as exc:
                 self.enabled, self.fatal = False, True

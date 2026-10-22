@@ -960,10 +960,14 @@ class TradingWindow(QMainWindow):
             lines.append(f"#{record['seq']} {stamp} [{record['kind']}] {message}")
         if state.get("audit_error"):
             lines.append(state["audit_error"])
-        for line in ([] if state.get("audit") else state.get("logs", [])[-300:]):
+        for line in state.get("logs", [])[-300:]:
             if isinstance(line, dict):
+                if state.get("audit") and line.get("persisted", True):
+                    continue
                 stamp = line.get("time")
                 prefix = datetime.fromtimestamp(stamp).strftime("%H:%M:%S") + " " if isinstance(stamp, (int, float)) else ""
+                if line.get("persisted") is False:
+                    prefix += "[未落盘] "
                 lines.append(prefix + str(line.get("message", line)))
             else:
                 lines.append(str(line))

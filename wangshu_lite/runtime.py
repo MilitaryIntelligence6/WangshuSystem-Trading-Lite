@@ -71,11 +71,14 @@ class Runtime:
 
     def log(self, message):
         message = self._redact(message)
+        entry = {"time": time.time(), "message": message, "persisted": False}
         with self._log_lock:
-            self._logs.append({"time": time.time(), "message": message})
+            self._logs.append(entry)
         if self.journal:
             try:
                 self.journal.audit("runtime", {"message": message})
+                with self._log_lock:
+                    entry["persisted"] = True
             except Exception:
                 # Logging must not throw back into a native broker callback.
                 if self.kernel:
@@ -87,7 +90,7 @@ class Runtime:
                             pass
                 if not self._log_failed:
                     with self._log_lock:
-                        self._logs.append({"time": time.time(), "message": "运行日志写入失败，已停止新单；仍可尝试撤单"})
+                        self._logs.append({"time": time.time(), "message": "运行日志写入失败，已停止新单；仍可尝试撤单", "persisted": False})
                     self._log_failed = True
 
     def _connection_event(self, kind, value):

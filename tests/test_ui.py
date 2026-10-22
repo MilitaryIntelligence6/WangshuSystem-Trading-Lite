@@ -263,6 +263,30 @@ class DesktopTests(unittest.TestCase):
         self.assertTrue(destination.exists())
         self.assertFalse(self.errors)
 
+    def test_unsaved_runtime_logs_remain_visible_alongside_existing_disk_history(self):
+        self.connect_paper()
+        self.window.timer.stop()
+        self.runtime.log("已落盘界面日志")
+        self.window.poll()
+        self.wait(lambda: not self.window._polling)
+        self.assertEqual(self.window.logs.toPlainText().count("已落盘界面日志"), 1)
+        with patch.object(self.runtime.journal, "audit", side_effect=OSError("disk full")):
+            self.runtime.log("本次写入失败的实时日志")
+            self.runtime.kernel.on_event("error", "CTP ErrorID=999：柜台原始错误仍需展示")
+            self.window.poll()
+            self.wait(lambda: not self.window._polling)
+        text = self.window.logs.toPlainText()
+        self.assertIn("已落盘界面日志", text)
+        self.assertIn("[未落盘] 本次写入失败的实时日志", text)
+        self.assertIn("[未落盘] 运行日志写入失败", text)
+        self.assertIn("CTP ErrorID=999：柜台原始错误仍需展示", text)
+        self.assertFalse(self.window.send_button.isEnabled())
+        self.assertTrue(self.window.cancel_button.isEnabled())
+        self.assertTrue(self.window.state["audit"])
+        self.window.tabs.setCurrentIndex(2)
+        self.screenshot("lite-unsaved-logs.png")
+        self.assertFalse(self.errors)
+
     def test_close_waits_for_log_export_without_destroying_a_running_thread(self):
         self.connect_paper()
         self.window.timer.stop()

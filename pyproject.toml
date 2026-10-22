@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wangshu-trading-lite"
+version = "0.1.0"
+description = "Minimal single-account CTP execution, native desktop and vn.py CTA"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+desktop = ["PySide6==6.8.2.1"]
+strategy = ["vnpy==4.4.0", "vnpy_ctastrategy==1.4.1"]
+ctp = [
+    "vnpy==4.4.0",
+    "vnpy_ctp==6.7.11.4; sys_platform != 'darwin'",
+    "vnpy_ctp @ https://github.com/vnpy/vnpy_ctp/archive/fa199f70dac9e242c20e925c17e2241b877e694f.tar.gz ; sys_platform == 'darwin'",
+]
+
+[project.gui-scripts]
+wangshu-lite = "wangshu_lite.ui:main"
+
+[tool.setuptools.packages.find]
+include = ["wangshu_lite*"]

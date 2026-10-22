@@ -2,7 +2,7 @@
 
 No capital budget, loss cap, activity quota, valuation gate or UI dependency.
 """
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from decimal import Decimal
 import json
 import math
@@ -56,8 +56,16 @@ class TradingKernel:
         self.gateway = gateway
 
     def _audit(self, kind, detail):
+        def redacted(value):
+            if isinstance(value, str):
+                return self.redact(value)
+            if isinstance(value, dict):
+                return {key: redacted(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [redacted(item) for item in value]
+            return value
         try:
-            self.journal.audit(kind, detail)
+            self.journal.audit(kind, redacted(detail))
         except Exception:
             self.enabled, self.fatal = False, True
             self._notify("enabled", False)
@@ -71,6 +79,7 @@ class TradingKernel:
                         return
                     data = data.data
                 if kind == "connection":
+                    data = replace(data, reason=self.redact(data.reason))
                     changed_day = self.connection.trading_day and self.connection.trading_day != data.trading_day
                     if not data.ready or changed_day:
                         self.enabled = False
@@ -79,6 +88,8 @@ class TradingKernel:
                         self.contracts.clear()
                         self.ticks.clear()
                     self.connection = data
+                    self._audit(kind, asdict(data))
+                    self.output(self.redact(f"连接状态：connected={data.connected}, ready={data.ready}, 交易日={data.trading_day or '未知'}；{data.reason}"))
                 elif kind == "contract":
                     self.contracts[data.vt_symbol] = data
                 elif kind == "tick":
@@ -109,6 +120,7 @@ class TradingKernel:
                     self._audit(kind, asdict(data))
                 elif kind in {"log", "error"}:
                     data = self.redact(data)
+                    self._audit(kind, {"message": data})
                     self.output(data)
                 self._notify(kind, data)
             except Exception as exc:
@@ -164,21 +176,23 @@ class TradingKernel:
             raise TradingError("请求编号已使用，不重复发送")
         if self.unresolved():
             raise TradingError("上次发送结果未核实，禁止自动重发或继续报单")
-        c = self.contracts.get(req.vt_symbol)
+        c = self.contracts.get(req.vt_symbol) if isinstance(req.vt_symbol, str) else None
         if not c or c.product not in {"FUTURES", "OPTION"}:
-            raise TradingError("未收到可交易的期货或期权合约信息")
-        if req.side not in {"BUY", "SELL"} or req.offset not in {"OPEN", "CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}:
+            raise TradingError(f"合约 {req.vt_symbol!r} 未收到可交易的期货或期权合约信息")
+        if not isinstance(req.side, str) or not isinstance(req.offset, str) or req.side not in {"BUY", "SELL"} or req.offset not in {"OPEN", "CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}:
             raise TradingError("买卖或开平字段无效")
         if c.product == "OPTION" and ((req.offset == "OPEN" and req.side != "BUY") or (req.offset != "OPEN" and req.side != "SELL")):
             raise TradingError("Lite 当前仅保留期权买方的买开、卖平")
-        if type(req.volume) is not int or not max(1, c.min_volume) <= req.volume <= 2_147_483_647 or c.max_volume and req.volume > c.max_volume:
-            raise TradingError("手数必须为正整数，并符合柜台合约数量范围")
-        if req.order_type not in {"LIMIT", "FAK", "FOK"} or req.condition_mode != "IMMEDIATE" or req.trigger_price or req.comparator:
+        if type(req.volume) is not int or not max(1, c.min_volume) <= req.volume <= 2_147_483_647:
+            raise TradingError(f"手数必须为整数，且不少于柜台最小数量 {max(1, c.min_volume)}、不超过CTP字段范围")
+        if c.max_volume and req.volume > c.max_volume:
+            raise TradingError(f"委托 {req.volume} 手超过柜台合约最大单笔数量 {c.max_volume} 手")
+        if not isinstance(req.order_type, str) or req.order_type not in {"LIMIT", "FAK", "FOK"} or req.condition_mode != "IMMEDIATE" or req.trigger_price or req.comparator:
             raise TradingError("Lite 支持立即执行的 LIMIT、FAK、FOK 委托")
         if type(req.price) not in (int, float) or not math.isfinite(req.price) or not 0 < req.price < 1e100:
             raise TradingError("价格必须为有限正数")
         if not math.isfinite(c.pricetick) or c.pricetick <= 0 or Decimal(str(req.price)) % Decimal(str(c.pricetick)):
-            raise TradingError("价格不符合合约最小变动价位")
+            raise TradingError(f"委托价格 {req.price} 不符合柜台合约最小变动价位 {c.pricetick}")
         exchange = req.vt_symbol.rsplit(".", 1)[1]
         if req.offset != "OPEN":
             if exchange in {"SHFE", "INE"} and req.offset == "CLOSE":
@@ -188,7 +202,12 @@ class TradingKernel:
 
     def send_order(self, req, source="manual"):
         with self._lock:
-            self._validate(req)
+            try:
+                self._validate(req)
+            except TradingError as exc:
+                reason = self.redact(exc)
+                self._audit("order_rejected", {"source": source, "client_id": str(getattr(req, "client_id", "")), "reason": reason})
+                raise TradingError(reason) from None
             try:
                 self.journal.reserve(req, self.connection.trading_day, source)
             except Exception:
@@ -205,20 +224,26 @@ class TradingKernel:
                     self.orders[oid] = Order(oid, req.vt_symbol, req.side, req.offset, req.volume, req.price, order_type=req.order_type)
                 elif not self.orders[oid].active:
                     self.journal.terminal(oid)
+                self._audit("order_sent", {"source": source, "client_id": req.client_id, "order_id": oid})
                 return oid
             except GatewayPreflightError as exc:
                 try:
                     self.journal.not_sent(req.client_id)
+                    self._audit("order_rejected", {"source": source, "client_id": req.client_id, "state": "NOT_SENT", "reason": str(exc)})
                 except Exception:
                     self.enabled, self.fatal = False, True
                     self._notify("enabled", False)
                 raise TradingError(self.redact(f"发送前被拒绝，本次未发单：{exc}")) from None
-            except Exception:
+            except Exception as exc:
                 self.enabled = False
                 try:
                     self.journal.unknown(req.client_id)
                 except Exception:
                     self.fatal = True
+                try:
+                    self._audit("order_unknown", {"source": source, "client_id": req.client_id, "reason": str(exc)})
+                except TradingError:
+                    pass
                 self._notify("enabled", False)
                 raise TradingError("发送结果不确定，请查询核对；本程序不会自动重发") from None
 
@@ -228,21 +253,48 @@ class TradingKernel:
             if not order or not order.active:
                 raise TradingError("请选择仍然活动的柜台委托")
             try:
-                self._audit("cancel_requested", {"order_id": order_id})
-            except TradingError:
-                pass  # A failed local disk must not prevent a broker cancellation.
-            self.gateway.cancel_order(order)
+                day = self.gateway.health().trading_day
+            except Exception:
+                day = ""
+            if not isinstance(day, str) or not re.fullmatch(r"[0-9]{8}", day):
+                day = ""
+                self.journal.mark_activity_gap("撤单时无法确认柜台交易日")
+            elif day != self.connection.trading_day:
+                self.journal.mark_activity_gap("撤单时柜台交易日与回报缓存不一致", day)
+                if isinstance(self.connection.trading_day, str) and re.fullmatch(r"[0-9]{8}", self.connection.trading_day):
+                    self.journal.mark_activity_gap("撤单时柜台交易日与回报缓存不一致", self.connection.trading_day)
+            try:
+                self.journal.record_cancel(order_id, day)
+            except Exception:
+                self.journal.mark_activity_gap("撤单请求计数保存失败", day)
+                self.enabled, self.fatal = False, True
+                try:
+                    self._notify("enabled", False)
+                except Exception:
+                    pass  # A failed local disk must not prevent a broker cancellation.
+            try:
+                self.gateway.cancel_order(order)
+            except Exception as exc:
+                try:
+                    self._audit("cancel_failed", {"order_id": order_id, "reason": str(exc)})
+                except Exception:
+                    pass
+                raise TradingError(self.redact(str(exc))) from None
+
+    def cancel_orders(self, order_ids):
+        results = {}
+        for order_id in dict.fromkeys(order_ids):
+            try:
+                self.cancel(order_id)
+                results[order_id] = "已请求，等待柜台回报"
+            except Exception as exc:
+                results[order_id] = self.redact(str(exc))
+        return results
 
     def cancel_all(self):
-        results = {}
-        for order in list(self.orders.values()):
-            if order.active:
-                try:
-                    self.cancel(order.order_id)
-                    results[order.order_id] = "已请求，等待柜台回报"
-                except Exception as exc:
-                    results[order.order_id] = self.redact(str(exc))
-        return results
+        with self._lock:
+            order_ids = [order.order_id for order in self.orders.values() if order.active]
+        return self.cancel_orders(order_ids)
 
     def unresolved(self):
         return [r for r in self.journal.intents(pending=True) if r["state"] in {"RESERVED", "UNKNOWN"} or r["order_id"] not in self.orders]

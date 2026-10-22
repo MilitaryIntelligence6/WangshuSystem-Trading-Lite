@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from .core import TradingError, TradingKernel
 from .models import Connection, OrderIntent
+from .monitor import ActivityMonitor, METRICS
 from .storage import Journal
 
 
@@ -48,6 +49,7 @@ class Runtime:
     def __init__(self, directory=None):
         self.directory = Path(directory or default_directory()).resolve()
         self.kernel = self.journal = self.gateway = self.strategies = None
+        self.monitor = None
         self.mode = "disconnected"
         self._logs = deque(maxlen=300)
         self._log_lock = threading.Lock()
@@ -59,6 +61,8 @@ class Runtime:
         self._secrets = ()
         self.connection_profile = {}
         self.connection_error = ""
+        self._last_audit = []
+        self._log_failed = False
 
     def _redact(self, message):
         for secret in self._secrets:
@@ -69,6 +73,22 @@ class Runtime:
         message = self._redact(message)
         with self._log_lock:
             self._logs.append({"time": time.time(), "message": message})
+        if self.journal:
+            try:
+                self.journal.audit("runtime", {"message": message})
+            except Exception:
+                # Logging must not throw back into a native broker callback.
+                if self.kernel:
+                    with self.kernel._lock:
+                        self.kernel.enabled, self.kernel.fatal = False, True
+                        try:
+                            self.kernel._notify("enabled", False)
+                        except Exception:
+                            pass
+                if not self._log_failed:
+                    with self._log_lock:
+                        self._logs.append({"time": time.time(), "message": "运行日志写入失败，已停止新单；仍可尝试撤单"})
+                    self._log_failed = True
 
     def _connection_event(self, kind, value):
         if kind == "error":
@@ -151,6 +171,11 @@ class Runtime:
             self.connection_error = ""
             try:
                 self.journal = Journal(account_directory, binding)
+                self.monitor = ActivityMonitor(self.journal)
+                self._last_audit = []
+                self._log_failed = False
+                with self._log_lock:
+                    self._logs.clear()
                 self.kernel = TradingKernel(self.journal, self.log, settings.get("用户名", "PAPER"), self._secrets)
                 self.kernel.add_listener(self._connection_event)
                 if mode == "paper":
@@ -229,6 +254,23 @@ class Runtime:
     def cancel_all(self):
         return self._kernel().cancel_all()
 
+    def cancel_orders(self, order_ids):
+        return self._kernel().cancel_orders(order_ids)
+
+    def update_activity_limits(self, limits):
+        self._kernel()
+        error = self.monitor.update_limits(limits)
+        if error:
+            raise TradingError(error)
+        return "预警阈值已保存；仅提示，不阻断报单或撤单"
+
+    def export_logs(self, destination):
+        with self._lifecycle:
+            self._kernel()
+            journal = self.journal
+        rows = journal.export_audit(Path(destination))
+        return {"rows": rows, "path": str(Path(destination).resolve())}
+
     def reconcile(self, client_id, order_id):
         self._kernel().reconcile(client_id, order_id)
         return "已绑定匹配柜台委托；核对后仍须手动允许下单"
@@ -271,6 +313,16 @@ class Runtime:
                                            if self.gateway and hasattr(self.gateway, "connection_status") else {})
             state["connection_error"] = self.connection_error
             state["strategies"] = self.strategies.snapshot() if self.strategies else []
+            state["activity_monitor"] = (self.monitor.snapshot(state["connection"].get("trading_day", ""))
+                if self.monitor else {"available": False, "day": "", "counts": dict.fromkeys(METRICS),
+                                      "limits": dict.fromkeys(METRICS, 0), "alerts": [], "error": "连接后显示本账户统计"})
+            state["activity_monitor"]["session_id"] = self.journal.directory.name if self.journal else ""
+            state["audit_error"] = ""
+            try:
+                state["audit"] = self.journal.list_audit() if self.journal else self._last_audit
+            except Exception:
+                state["audit"] = []
+                state["audit_error"] = "持久日志读取失败，请检查本地日志目录"
             with self._log_lock:
                 state["logs"] = list(self._logs)
             return state
@@ -298,6 +350,11 @@ class Runtime:
                 elif self.gateway:
                     self.gateway.close()
                 if self.journal:
+                    self.log("会话已断开；断开不等于柜台活动委托已撤销，请核对最终回报")
+                    try:
+                        self._last_audit = self.journal.list_audit()
+                    except Exception:
+                        self._last_audit = []
                     self.journal.close()
             except Exception as exc:
                 self._close_failed = True
@@ -306,11 +363,11 @@ class Runtime:
                 self.log(f"会话关闭失败，已保留账户锁：{exc}")
                 raise TradingError("关闭失败，旧线程状态须核查；请退出重启，不允许启动第二会话") from None
             self.strategies = self.kernel = self.gateway = self.journal = None
+            self.monitor = None
             self.mode = "disconnected"
             if self._owns_native:
                 self._owns_native = False
                 _native_owner.release()
-            self.log("会话已断开；断开不等于柜台活动委托已撤销，请核对最终回报")
             return "会话已断开"
 
     def close(self):

@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import uuid
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot, QItemSelectionModel
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QCompleter, QDoubleSpinBox, QFileDialog,
@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
     QVBoxLayout, QWidget, QAbstractItemView, QHeaderView,
 )
+
+from .monitor import METRICS, MAX_LIMIT
 
 
 class NoWheelSpinBox(QSpinBox):
@@ -46,7 +48,7 @@ class Worker(QObject):
         else:
             self.finished.emit(action, result, None)
         finally:
-            if action == "finalize":
+            if action in {"finalize", "export"}:
                 QThread.currentThread().quit()
 
 
@@ -62,6 +64,7 @@ def _value(value):
 
 class TradingWindow(QMainWindow):
     requested = Signal(str, object)
+    export_requested = Signal(str, object)
 
     def __init__(self, runtime):
         super().__init__()
@@ -78,6 +81,8 @@ class TradingWindow(QMainWindow):
         self._catalog_symbols = ()
         self._connection_drafts = {}
         self._active_connection_environment = "simulation"
+        self._activity_session = None
+        self._export_thread = None
         self.setWindowTitle("望舒 Lite · 人工交易与 vn.py CTA")
         self.resize(1220, 860)
         self.setMinimumSize(760, 600)
@@ -215,15 +220,20 @@ class TradingWindow(QMainWindow):
         self.account_label = QLabel("资金：—")
         self.account_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.layout.addWidget(self.account_label)
+        self.activity_summary = QLabel("报撤统计：连接后显示")
+        self.activity_summary.setWordWrap(True)
+        self.layout.addWidget(self.activity_summary)
+        self.activity_warning = QLabel()
+        self.activity_warning.setWordWrap(True)
+        self.activity_warning.setStyleSheet("color: #b54708; font-weight: bold")
+        self.layout.addWidget(self.activity_warning)
 
         self.tabs = QTabWidget()
         self.layout.addWidget(self.tabs, 1)
         self._build_trading()
         self._build_strategies()
-        self.logs = QPlainTextEdit()
-        self.logs.setReadOnly(True)
-        self.logs.setMaximumBlockCount(500)
-        self.tabs.addTab(self.logs, "日志")
+        self._build_logs()
+        self._build_activity()
         self.notice = QLabel("委托、成交及撤单结果以柜台回报为准。连接参数不包含账户、密码或 AuthCode。")
         self.notice.setWordWrap(True)
         self.layout.addWidget(self.notice)
@@ -294,16 +304,69 @@ class TradingWindow(QMainWindow):
         record_layout.addLayout(actions)
         self.records = QTabWidget()
         self.orders = self._table(["委托号", "合约", "买卖", "开平", "价格", "手数", "已成交", "状态", "来源"])
+        self.orders.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.orders.setToolTip("按住 Ctrl / Command 或 Shift 可选择多笔委托后批量撤单")
         self.positions = self._table(["合约", "方向", "持仓", "昨仓", "冻结", "成本价", "持仓盈亏"])
         self.trades = self._table(["成交号", "委托号", "合约", "买卖", "开平", "价格", "手数"])
         self.unresolved = self._table(["请求 ID", "交易日", "状态", "委托号"])
         for name, table in (("委托", self.orders), ("持仓", self.positions), ("成交", self.trades), ("待核实", self.unresolved)):
             self.records.addTab(table, name)
+        self.cancel_results = QPlainTextEdit()
+        self.cancel_results.setReadOnly(True)
+        self.cancel_results.setPlaceholderText("显示最近一次撤单的逐笔请求结果；最终撤单状态请看委托表的柜台回报。")
+        self.records.addTab(self.cancel_results, "撤单请求结果")
         record_layout.addWidget(self.records)
         splitter.addWidget(records)
         splitter.setSizes([330, 260])
         layout.addWidget(splitter)
         self.tabs.addTab(tab, "交易")
+
+    def _build_logs(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        actions = QHBoxLayout()
+        self.audit_note = QLabel("最近 300 条持久日志；导出包含当前账户的完整记录。")
+        self.audit_note.setWordWrap(True)
+        actions.addWidget(self.audit_note, 1)
+        self.export_logs_button = self._button("导出完整日志 CSV", self.export_logs, actions)
+        layout.addLayout(actions)
+        self.logs = QPlainTextEdit()
+        self.logs.setReadOnly(True)
+        self.logs.setMaximumBlockCount(1200)
+        layout.addWidget(self.logs)
+        self.tabs.addTab(tab, "日志")
+
+    def _build_activity(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        note = QLabel("统计本机当前账户的报单与撤单请求。近 60 秒为滚动窗口，当日以柜台交易日为准。\n"
+                      "报单含发送结果待核实的请求，不含明确未发出的请求；撤单按尝试次数统计。不是柜台受理或成功次数，也不含其他终端。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QGridLayout()
+        for column, title in enumerate(("监测项", "当前次数", "预警阈值（次，0 关闭）")):
+            form.addWidget(QLabel(title), 0, column)
+        self.activity_inputs, self.activity_values = {}, {}
+        for row, (key, label) in enumerate(METRICS.items(), 1):
+            form.addWidget(QLabel(label), row, 0)
+            value = QLabel("—")
+            self.activity_values[key] = value
+            form.addWidget(value, row, 1)
+            spin = NoWheelSpinBox()
+            spin.setRange(0, MAX_LIMIT)
+            spin.setKeyboardTracking(False)
+            self.activity_inputs[key] = spin
+            form.addWidget(spin, row, 2)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        self.save_activity_button = self._button("保存预警阈值", self.save_activity_limits, actions)
+        actions.addWidget(QLabel("达到阈值仅提示，不阻断报单或撤单。"), 1)
+        layout.addLayout(actions)
+        self.activity_detail = QLabel("连接后读取本账户保存的阈值。")
+        self.activity_detail.setWordWrap(True)
+        layout.addWidget(self.activity_detail)
+        layout.addStretch()
+        self.tabs.addTab(tab, "报撤监测")
 
     def _build_strategies(self):
         tab = QWidget()
@@ -453,7 +516,7 @@ class TradingWindow(QMainWindow):
                 QMessageBox.critical(self, "退出失败", error + "\n请核对柜台后重试。")
             else:
                 self._allow_close = True
-                self._thread.finished.connect(self.close)
+                self._thread.finished.connect(self._close_if_ready)
                 self._thread.quit()
         else:
             self._busy = False
@@ -498,6 +561,12 @@ class TradingWindow(QMainWindow):
         self.init_strategy_button.setEnabled(idle and ready)
         for button in (self.cancel_button, self.cancel_all_button, self.query_button, self.subscribe_button):
             button.setEnabled(idle and active)
+        for button in (self.save_activity_button, self.export_logs_button):
+            button.setEnabled(idle and active)
+        if self._export_thread is not None:
+            self.export_logs_button.setEnabled(False)
+        for spin in self.activity_inputs.values():
+            spin.setEnabled(idle and active)
         paper = self.state.get("mode", self.mode.currentData()) == "paper"
         self.fill_button.setVisible(paper)
         self.partial_button.setVisible(paper)
@@ -598,13 +667,75 @@ class TradingWindow(QMainWindow):
         return self.orders.item(row, 0).text()
 
     def cancel_selected(self):
-        oid = self._selected_order()
-        if oid:
-            self._submit("撤单", lambda: self.runtime.cancel(oid))
+        order_ids = [self.orders.item(index.row(), 0).text() for index in self.orders.selectionModel().selectedRows()]
+        if not order_ids:
+            QMessageBox.information(self, "选择委托", "请先选择一笔或多笔委托；按住 Ctrl / Command 或 Shift 可多选。")
+            return
+        if len(order_ids) > 1 and not self.confirm("批量撤单", f"请求撤销所选 {len(order_ids)} 笔委托？逐笔结果会显示在撤单请求结果页。最终状态以柜台回报为准。"):
+            return
+        self._submit("撤单", lambda: self.runtime.cancel_orders(order_ids), self._show_cancel_results)
 
     def cancel_all(self):
         if self.confirm("撤全部活动委托", "向柜台请求撤销全部已知活动委托；成功与否以回报为准。继续？"):
-            self._submit("全部撤单", self.runtime.cancel_all)
+            self._submit("全部撤单", self.runtime.cancel_all, self._show_cancel_results)
+
+    def _show_cancel_results(self, results):
+        lines = ["请求结果；最终撤单状态请看委托表的柜台回报。"]
+        lines.extend(f"{order_id}：{result}" for order_id, result in results.items())
+        if not results:
+            lines.append("没有已知活动委托需要撤销。")
+        self.cancel_results.setPlainText("\n".join(lines))
+        if len(results) > 1:
+            self.records.setCurrentWidget(self.cancel_results)
+
+    def save_activity_limits(self):
+        limits = {key: widget.value() for key, widget in self.activity_inputs.items()}
+        self._submit("保存预警阈值", lambda: self.runtime.update_activity_limits(limits), self._saved_activity_limits)
+
+    def _saved_activity_limits(self, result):
+        self._activity_session = None
+        self.activity_detail.setText(str(result))
+
+    def export_logs(self):
+        if self._export_thread is not None:
+            return
+        filename = "wangshu-lite-audit-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".csv"
+        path, _ = QFileDialog.getSaveFileName(self, "导出当前账户完整日志（请选择新文件）", filename, "CSV 日志 (*.csv)")
+        if path:
+            # A slow full-history export must leave the trading worker free to cancel.
+            self._export_thread = QThread(self)
+            self._export_worker = Worker()
+            self._export_worker.moveToThread(self._export_thread)
+            self.export_requested.connect(self._export_worker.execute)
+            self._export_worker.finished.connect(self._export_finished)
+            self._export_thread.finished.connect(self._export_worker.deleteLater)
+            self._export_thread.finished.connect(self._export_done)
+            self._export_thread.start()
+            self.export_logs_button.setEnabled(False)
+            self.audit_note.setText("正在导出完整日志；交易与撤单仍可使用。")
+            self.export_requested.emit("export", lambda: self.runtime.export_logs(path))
+
+    @Slot(str, object, object)
+    def _export_finished(self, action, result, error):
+        if error:
+            self.audit_note.setText("日志导出失败：" + error)
+            if not self._closing:
+                QMessageBox.warning(self, "日志导出失败", error)
+        else:
+            self.audit_note.setText(f"已导出 {result['rows']} 条：{result['path']}")
+
+    @Slot()
+    def _export_done(self):
+        self._export_thread.deleteLater()
+        self._export_thread = None
+        self._export_worker = None
+        self._apply_enabled()
+        self._close_if_ready()
+
+    @Slot()
+    def _close_if_ready(self):
+        if self._allow_close and not self._thread.isRunning() and self._export_thread is None:
+            self.close()
 
     def reconcile_selected(self):
         row = self.unresolved.currentRow()
@@ -728,18 +859,23 @@ class TradingWindow(QMainWindow):
         if self._table_values.get(table) == values:
             return
         self._table_values[table] = values
-        selected = table.item(table.currentRow(), 0).text() if table.currentRow() >= 0 else None
+        selected = {table.item(index.row(), 0).text() for index in table.selectionModel().selectedRows()}
+        current = table.item(table.currentRow(), 0).text() if table.currentRow() >= 0 else None
         table.blockSignals(True)
         table.setUpdatesEnabled(False)
         table.setRowCount(len(values))
-        selected_row = None
+        table.clearSelection()
+        current_row = None
         for row, cells in enumerate(values):
             for column, value in enumerate(cells):
                 table.setItem(row, column, QTableWidgetItem(value))
-            if cells and cells[0] == selected:
-                selected_row = row
-        if selected_row is not None:
-            table.selectRow(selected_row)
+            if cells and cells[0] in selected:
+                table.selectionModel().select(table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+            if cells and cells[0] == current:
+                current_row = row
+        if current_row is not None:
+            table.setCurrentCell(current_row, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
         table.setUpdatesEnabled(True)
         table.blockSignals(False)
 
@@ -794,6 +930,7 @@ class TradingWindow(QMainWindow):
         account = state.get("account") or {}
         self.account_label.setText("   ".join(label + " " + _value(account.get(key)) for label, key in
                                             (("资金", "balance"), ("可用", "available"), ("保证金", "margin"), ("冻结保证金", "frozen_margin"), ("手续费", "commission"))))
+        self._render_activity()
         symbols = tuple(c["vt_symbol"] for c in state.get("contracts", []))
         if symbols != self._catalog_symbols:
             self._catalog_symbols = symbols
@@ -816,7 +953,14 @@ class TradingWindow(QMainWindow):
             if item:
                 self._render_strategy_detail(item)
         lines = []
-        for line in state.get("logs", [])[-500:]:
+        for record in reversed(state.get("audit", [])):
+            stamp = datetime.fromtimestamp(record["time"]).strftime("%Y-%m-%d %H:%M:%S")
+            detail = record["detail"]
+            message = detail["message"] if isinstance(detail, dict) and set(detail) == {"message"} else _value(detail)
+            lines.append(f"#{record['seq']} {stamp} [{record['kind']}] {message}")
+        if state.get("audit_error"):
+            lines.append(state["audit_error"])
+        for line in ([] if state.get("audit") else state.get("logs", [])[-300:]):
             if isinstance(line, dict):
                 stamp = line.get("time")
                 prefix = datetime.fromtimestamp(stamp).strftime("%H:%M:%S") + " " if isinstance(stamp, (int, float)) else ""
@@ -830,8 +974,30 @@ class TradingWindow(QMainWindow):
             if bottom:
                 self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
 
+    def _render_activity(self):
+        monitor = self.state.get("activity_monitor") or {}
+        counts = monitor.get("counts", {})
+        available = monitor.get("available", False)
+        session = monitor.get("session_id", "")
+        if session != self._activity_session:
+            for key, widget in self.activity_inputs.items():
+                widget.setValue(monitor.get("limits", {}).get(key, 0))
+            self._activity_session = session
+        for key, label in self.activity_values.items():
+            label.setText(_value(counts.get(key)) if available else "—")
+        if available:
+            values = "  ·  ".join(label + " " + str(counts[key]) for key, label in METRICS.items())
+            self.activity_summary.setText(f"本机报撤 · {monitor.get('day', '')} · {values}")
+        else:
+            self.activity_summary.setText("报撤统计暂不可用：" + monitor.get("error", "连接后显示"))
+        warnings = [alert["message"] for alert in monitor.get("alerts", [])]
+        self.activity_warning.setText("预警（仅提示）：" + "；".join(warnings) if warnings else "")
+        self.activity_warning.setVisible(bool(warnings))
+        self.activity_detail.setText("；".join(warnings) if warnings else
+                                     ("当前无预警；0 关闭预警，保存后按本账户持久化。" if available else monitor.get("error", "")))
+
     def closeEvent(self, event: QCloseEvent):
-        if self._allow_close:
+        if self._allow_close and self._export_thread is None:
             event.accept()
             return
         event.ignore()
@@ -863,3 +1029,5 @@ def main(argv=None):
             window.timer.stop()
             window.requested.emit("finalize", runtime.close)
             window._thread.wait()
+        if window._export_thread is not None:
+            window._export_thread.wait()

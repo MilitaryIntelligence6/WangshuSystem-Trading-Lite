@@ -15,7 +15,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 RUN_QT = os.environ.get("WANGSHU_LITE_QT_TESTS") == "1" and importlib.util.find_spec("PySide6") is not None
 if RUN_QT:
-    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtCore import QPoint, QPointF, Qt, QItemSelectionModel
     from PySide6.QtGui import QWheelEvent
     from PySide6.QtWidgets import QApplication, QMessageBox
     from wangshu_lite.runtime import Runtime
@@ -121,7 +121,8 @@ class DesktopTests(unittest.TestCase):
 
     def test_mouse_wheel_and_trackpad_do_not_modify_numeric_or_choice_inputs(self):
         self.window.timer.stop()
-        for widget in (self.window.volume, self.window.price, self.window.side, self.window.offset, self.window.order_type):
+        for widget in (self.window.volume, self.window.price, self.window.side, self.window.offset, self.window.order_type,
+                       *self.window.activity_inputs.values()):
             widget.setFocus()
             before = widget.value() if hasattr(widget, "value") else widget.currentIndex()
             for pixel, angle in ((QPoint(), QPoint(0, 120)), (QPoint(0, -24), QPoint())):
@@ -131,6 +132,166 @@ class DesktopTests(unittest.TestCase):
                 self.app.sendEvent(widget, event)
             after = widget.value() if hasattr(widget, "value") else widget.currentIndex()
             self.assertEqual(before, after)
+
+    def test_activity_warning_is_visible_persisted_and_never_blocks_manual_trading(self):
+        self.connect_paper()
+        self.window.timer.stop()
+        self.window.activity_inputs["orders_today"].setValue(2)
+        self.window.save_activity_button.click()
+        self.refreshed(lambda state: state["activity_monitor"]["limits"]["orders_today"] == 2)
+        for count in range(1, 4):
+            self.window.send_button.click()
+            self.refreshed(lambda state: len(state["orders"]) == count)
+        self.assertIn("当日报单3次", self.window.activity_warning.text())
+        self.assertTrue(self.window.send_button.isEnabled())
+        self.assertTrue(self.window.cancel_all_button.isEnabled())
+        self.assertTrue(self.window.state["enabled"])
+        self.window.activity_inputs["orders_today"].setValue(9)
+        self.window.poll()
+        self.wait(lambda: not self.window._polling)
+        self.assertEqual(self.window.activity_inputs["orders_today"].value(), 9)
+        self.window.disconnect_button.click()
+        self.refreshed(lambda state: state["mode"] == "disconnected")
+        self.connect_paper()
+        self.assertEqual(self.window.state["activity_monitor"]["counts"]["orders_today"], 3)
+        self.assertEqual(self.window.activity_inputs["orders_today"].value(), 2)
+        self.window.tabs.setCurrentIndex(3)
+        self.screenshot("lite-activity-monitor.png")
+        self.assertFalse(self.errors)
+
+    def test_multi_cancel_keeps_selection_during_reports_and_continues_after_one_failure(self):
+        self.connect_paper()
+        self.window.timer.stop()
+        self.window.volume.setValue(4)
+        for count in range(1, 4):
+            self.window.send_button.click()
+            self.refreshed(lambda state: len(state["orders"]) == count)
+        self.window.orders.selectRow(0)
+        self.window.partial_button.click()
+        self.refreshed(lambda state: state["orders"][0]["traded"] == 2)
+        selected_ids = [self.window.orders.item(row, 0).text() for row in (0, 2)]
+        for row in (0, 2):
+            self.window.orders.selectionModel().select(self.window.orders.model().index(row, 0),
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        # A changed report rebuilds the table without replacing the user's selection.
+        self.window.state["orders"][0]["status"] = "PARTIAL"
+        self.window._render()
+        self.assertEqual({self.window.orders.item(index.row(), 0).text()
+                          for index in self.window.orders.selectionModel().selectedRows()}, set(selected_ids))
+        original = self.runtime.gateway.cancel_order
+        attempted = []
+        def cancel(order):
+            attempted.append(order.order_id)
+            if order.order_id == selected_ids[0]:
+                raise RuntimeError("测试柜台撤单暂不可用")
+            return original(order)
+        with patch.object(self.runtime.gateway, "cancel_order", side_effect=cancel):
+            self.window.cancel_button.click()
+            self.refreshed(lambda state: any(order["order_id"] == selected_ids[1] and order["status"] == "CANCELLED"
+                                             for order in state["orders"]))
+        self.assertEqual(attempted, selected_ids)
+        self.assertIn("测试柜台撤单暂不可用", self.window.cancel_results.toPlainText())
+        self.assertIn("已请求，等待柜台回报", self.window.cancel_results.toPlainText())
+        self.assertEqual(self.window.state["activity_monitor"]["counts"]["cancels_today"], 2)
+        self.assertEqual(self.window.state["orders"][0]["traded"], 2)
+        self.assertNotEqual(self.window.state["orders"][1]["status"], "CANCELLED")
+        self.window.centralWidget().verticalScrollBar().setValue(self.window.centralWidget().verticalScrollBar().maximum())
+        self.screenshot("lite-multi-cancel.png")
+        self.assertFalse(self.errors)
+
+    def test_full_audit_export_uses_worker_and_logs_survive_reconnection(self):
+        self.connect_paper()
+        self.window.timer.stop()
+        self.runtime.log("界面导出与恢复记录")
+        self.window.disconnect_button.click()
+        self.refreshed(lambda state: state["mode"] == "disconnected")
+        self.connect_paper()
+        self.assertIn("界面导出与恢复记录", self.window.logs.toPlainText())
+        for index in range(320):
+            self.runtime.journal.audit("ui_export_test", {"index": index})
+        destination = Path(self.temp.name) / "complete-audit.csv"
+        threads = []
+        export = self.runtime.export_logs
+        def record_export(path):
+            threads.append(threading.current_thread())
+            return export(path)
+        with patch("wangshu_lite.ui.QFileDialog.getSaveFileName", return_value=(str(destination), "")), \
+             patch.object(self.runtime, "export_logs", side_effect=record_export):
+            self.window.export_logs_button.click()
+            self.wait(lambda: self.window._export_thread is None)
+        import csv
+        with destination.open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(sum(row["kind"] == "ui_export_test" for row in rows), 320)
+        self.assertTrue(all(thread is not threading.main_thread() for thread in threads))
+        self.assertIn("已导出", self.window.audit_note.text())
+        self.window.tabs.setCurrentIndex(2)
+        self.window.poll()
+        self.wait(lambda: not self.window._polling)
+        self.screenshot("lite-persistent-logs.png")
+        self.assertFalse(self.errors)
+
+    def test_slow_export_leaves_polling_and_manual_cancel_available(self):
+        self.connect_paper()
+        self.window.timer.stop()
+        self.window.send_button.click()
+        self.refreshed(lambda state: len(state["orders"]) == 1)
+        entered, release = threading.Event(), threading.Event()
+        destination = Path(self.temp.name) / "slow-audit.csv"
+        original = self.runtime.export_logs
+        def slow_export(path):
+            entered.set()
+            release.wait(5)
+            return original(path)
+        try:
+            with patch("wangshu_lite.ui.QFileDialog.getSaveFileName", return_value=(str(destination), "")), \
+                 patch.object(self.runtime, "export_logs", side_effect=slow_export):
+                self.window.export_logs_button.click()
+                self.wait(entered.is_set)
+                self.assertFalse(self.window._busy)
+                self.assertTrue(self.window.send_button.isEnabled())
+                self.assertFalse(self.window.export_logs_button.isEnabled())
+                self.window.orders.selectRow(0)
+                self.window.cancel_button.click()
+                self.refreshed(lambda state: state["orders"][0]["status"] == "CANCELLED")
+                self.assertFalse(destination.exists())
+                release.set()
+                self.wait(lambda: self.window._export_thread is None)
+        finally:
+            release.set()
+            self.wait(lambda: self.window._export_thread is None)
+        self.assertTrue(destination.exists())
+        self.assertFalse(self.errors)
+
+    def test_close_waits_for_log_export_without_destroying_a_running_thread(self):
+        self.connect_paper()
+        self.window.timer.stop()
+        entered, release = threading.Event(), threading.Event()
+        destination = Path(self.temp.name) / "close-audit.csv"
+        journal = self.runtime.journal
+        def slow_export(path):
+            entered.set()
+            release.wait(5)
+            rows = journal.export_audit(Path(path))
+            return {"rows": rows, "path": path}
+        try:
+            with patch("wangshu_lite.ui.QFileDialog.getSaveFileName", return_value=(str(destination), "")), \
+                 patch.object(self.runtime, "export_logs", side_effect=slow_export):
+                self.window.export_logs_button.click()
+                self.wait(entered.is_set)
+                self.window.close()
+                self.wait(lambda: not self.window._thread.isRunning())
+                self.assertTrue(self.window._export_thread.isRunning())
+                self.assertTrue(self.window.isVisible())
+                self.window.close()  # A repeated close cannot destroy the export thread.
+                self.assertTrue(self.window.isVisible())
+                release.set()
+                self.wait(lambda: self.window._export_thread is None and not self.window.isVisible())
+        finally:
+            release.set()
+            self.wait(lambda: self.window._export_thread is None)
+        self.assertTrue(destination.exists())
+        self.assertFalse(self.errors)
 
     def test_calls_are_off_ui_thread_and_snapshot_polling_does_not_accumulate(self):
         self.connect_paper()
